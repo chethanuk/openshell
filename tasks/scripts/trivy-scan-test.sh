@@ -120,6 +120,58 @@ expect_status 2 "broad ignore path" \
   env TRIVY_IGNORE_FILE="${TMP_DIR}/broad-ignore.yaml" \
   "${SCANNER}" validate-ignore
 
+# These are controller configuration in kube-system, not application workloads.
+# Keep the exception conditional on the charts targeting their own namespaces.
+mkdir -p "${TMP_DIR}/namespaces"
+for manifest in \
+  deploy/kube/manifests/openshell-helmchart.yaml \
+  deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml; do
+  yq --output-format json '.' "${REPO_ROOT}/${manifest}" | jq -se '
+    length == 1 and all(.[];
+      .apiVersion == "helm.cattle.io/v1" and .kind == "HelmChart"
+      and .metadata.namespace == "kube-system"
+      and .spec.targetNamespace == .metadata.name
+      and .spec.targetNamespace != "kube-system")
+  ' >/dev/null
+  cp "${REPO_ROOT}/${manifest}" "${TMP_DIR}/namespaces/"
+done
+cat >"${TMP_DIR}/namespaces/user-pod.yaml" <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: user-workload
+  namespace: kube-system
+spec:
+  containers:
+    - name: application
+      image: example.test/application:1
+EOF
+cat >"${TMP_DIR}/namespaces/role.yaml" <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: network-manager
+  namespace: openshell
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get"]
+EOF
+# Use embedded checks so this regression needs no network or cached database.
+expect_status 0 "scan HelmChart exceptions and a kube-system workload" \
+  trivy config --skip-version-check --skip-check-update --quiet \
+  --cache-dir "${TMP_DIR}/trivy-cache" --ignorefile "${REPO_ROOT}/.trivyignore.yaml" \
+  --format json --output "${TMP_DIR}/namespaces.json" "${TMP_DIR}/namespaces"
+jq -e '
+  [.Results[]? as $result | $result.Misconfigurations[]?
+    | select(.ID == "KSV-0037" or .ID == "KSV-0056")
+    | {id: .ID, target: $result.Target}]
+  | sort_by(.id) == [
+      {id: "KSV-0037", target: "user-pod.yaml"},
+      {id: "KSV-0056", target: "role.yaml"}
+    ]
+' "${TMP_DIR}/namespaces.json" >/dev/null
+
 # Consolidate more than 20 Helm profiles without losing resource identity or
 # the per-profile input counts needed by the gate. Exercise real Trivy SARIF
 # conversion with synthetic JSON; this requires no network or image downloads.

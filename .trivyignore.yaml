@@ -8,6 +8,17 @@
 # narrow.
 
 misconfigurations:
+  # K3s HelmChart objects configure its system Helm controller; targetNamespace
+  # places the application resources outside kube-system.
+  - id: KSV-0037
+    paths:
+      - "**/openshell-helmchart.yaml"
+      - "**/nvidia-device-plugin-helmchart.yaml"
+    statement: >-
+      These HelmChart CRs belong to the K3s Helm controller in kube-system.
+      Their spec.targetNamespace installs the charts into openshell and
+      nvidia-device-plugin respectively, not kube-system.
+
   # The namespace comes from `helm install -n`, not the rendered workload.
   - id: KSV-0110
     paths:
@@ -32,13 +43,3 @@ misconfigurations:
       - "**/deployment.yaml"
     statement: >-
       Images come from quay.io/ai-openshell, this project's own registry.
-
-  # The Kubernetes compute driver creates its runtime infrastructure and the
-  # per-sandbox outer egress fence in the configured sandbox namespace.
-  - id: KSV-0056
-    paths:
-      - "**/role.yaml"
-    statement: >-
-      The namespace-scoped gateway role can create Services and NetworkPolicy
-      resources so the compute driver can connect each sandbox runtime to its
-      supervisor while denying direct workload egress.
