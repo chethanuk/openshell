@@ -18,6 +18,11 @@ replicaCount: 2
 workload:
   kind: deployment
 
+# Supply measured gateway requests and limits for the intended workload.
+# Do not inherit the initial-deployment ceiling at this sandbox count.
+resources:
+  limits: null
+
 gatewayConfig:
   openshell.drivers.kubernetes:
     supervisor_topology: gateway

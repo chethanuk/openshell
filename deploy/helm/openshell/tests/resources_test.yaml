@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: control plane resource budgets
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+  - templates/deployment.yaml
+  - templates/supervisor.yaml
+
+tests:
+  - it: budgets the default gateway StatefulSet
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value: &gatewayBudget
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+
+  - it: budgets the gateway Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: openshell-db
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value: *gatewayBudget
+
+  - it: preserves gateway overrides and explicit limit removal
+    template: templates/statefulset.yaml
+    set:
+      resources.requests.cpu: 750m
+      resources.requests.memory: 1Gi
+      resources.limits: null
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests
+          value:
+            cpu: 750m
+            memory: 1Gi
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits
+
+  - it: allows removing the gateway budget
+    template: templates/statefulset.yaml
+    set:
+      resources: null
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value: null
+
+  - it: leaves the scale profile gateway ceiling to the operator
+    template: templates/deployment.yaml
+    values:
+      - ../values-scale-10k.yaml
+    set:
+      server.externalDbSecret: openshell-db
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits
+
+  - it: allows removing the shared supervisor budget
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+      supervisor.resources: null
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].resources

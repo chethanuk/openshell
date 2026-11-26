@@ -95,16 +95,17 @@ supervisor:
     # maxMembersPerGateway times maxInstancesPerMember sandboxes, never more
     # than 131072.
     maxMembersPerGateway: 32
-  # -- Resources of each shared supervisor container, unset by default.
-  # Memory grows with the sandboxes a supervisor runs; for the default of 128
-  # sandboxes, request 250m CPU and 768Mi memory with a 1.5Gi memory limit.
-  # Refer to Size Sandbox Capacity in the High Availability guide.
-  resources: {}
-  #   requests:
-  #     cpu: 250m
-  #     memory: 768Mi
-  #   limits:
-  #     memory: 1.5Gi
+  # -- Resources of each shared supervisor container, initially sized for
+  # 128 sandboxes. Increase these with pool.maxInstancesPerMember and allow
+  # for failover. Refer to Size Sandbox Capacity in the High Availability guide.
+  # Set resources to null to omit the budget, or limits to null to omit limits.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 768Mi
+    limits:
+      cpu: "1"
+      memory: 1.5Gi
   autoscaling:
     # -- Enable memory-based autoscaling of the shared supervisor Deployment.
     # Requires supervisor_topology = "gateway" and the Kubernetes resource
@@ -412,8 +413,17 @@ probes:
     # -- Readiness probe failure threshold before the pod is marked not ready.
     failureThreshold: 3
 
-# -- Gateway pod resource requests and limits.
-resources: {}
+# -- Gateway container resource requests and limits for an initial deployment.
+# Size for the number of sandboxes, retained logs, traffic, and failover; the
+# pool's logical capacity does not determine a safe resource budget.
+# Set resources to null to omit the budget, or limits to null to omit limits.
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
 
 # -- Node selector for the gateway pod.
 nodeSelector: {}

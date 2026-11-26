@@ -244,6 +244,7 @@ tests:
       workload.kind: deployment
       server.externalDbSecret: my-pg-secret
       autoscaling.enabled: true
+      resources: null
     asserts:
       - failedTemplate:
           errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
@@ -255,6 +256,7 @@ tests:
     set:
       autoscaling.targetMemoryUtilizationPercentage: 70
       resources.requests.memory: null
+      resources.limits.memory: null
     asserts:
       - failedTemplate:
           errorPattern: "autoscaling.targetMemoryUtilizationPercentage requires a positive resources.requests.memory"
@@ -294,18 +296,16 @@ tests:
       - failedTemplate:
           errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
 
-  # The chart renders a null request, which Kubernetes stores as zero instead
-  # of copying the limit.
-  - it: fails when the CPU request is null even with a CPU limit
-    template: templates/statefulset.yaml
+  - it: accepts a CPU limit when null removes the default CPU request
+    template: templates/hpa.yaml
     values:
       - ../ci/values-autoscaling.yaml
     set:
       resources.requests.cpu: null
       resources.limits.cpu: "1"
     asserts:
-      - failedTemplate:
-          errorPattern: "autoscaling.targetCPUUtilizationPercentage requires a positive resources.requests.cpu"
+      - isKind:
+          of: HorizontalPodAutoscaler
 
   - it: fails when the CPU request is zero in exponent form
     template: templates/statefulset.yaml
@@ -335,6 +335,7 @@ tests:
       server.externalDbSecret: my-pg-secret
       autoscaling.enabled: true
       autoscaling.targetMemoryUtilizationPercentage: 70
+      resources.requests: null
       resources.limits.cpu: "1"
       resources.limits.memory: 1Gi
     asserts:

@@ -377,8 +377,15 @@ tests:
           path: spec.replicas
           value: 1
         documentIndex: 0
-      - notExists:
+      - equal:
           path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              cpu: "1"
+              memory: 1.5Gi
         documentIndex: 0
       - contains:
           path: spec.template.spec.containers[0].env
