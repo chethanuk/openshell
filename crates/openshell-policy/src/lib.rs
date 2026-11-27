@@ -1272,7 +1272,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/etc".into(),
                 "/var/log".into(),
             ],
-            read_write: vec!["/tmp".into(), "/dev/null".into()],
+            read_write: vec!["/tmp".into(), "/var/tmp".into(), "/dev/null".into()],
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
@@ -3757,6 +3757,20 @@ network_policies:
         assert!(
             fs.read_write.iter().any(|p| p == "/tmp"),
             "read_write should contain /tmp"
+        );
+    }
+
+    #[test]
+    fn restrictive_default_allows_sqlite_temp_dir_fallback() {
+        // SQLite with TMPDIR unset probes /var/tmp before /tmp and does not
+        // account for Landlock, so /var/tmp must be writable too.
+        let fs = restrictive_default_policy()
+            .filesystem
+            .expect("must have filesystem policy");
+        assert!(
+            fs.read_write.iter().any(|p| p == "/var/tmp"),
+            "read_write should contain /var/tmp, got {:?}",
+            fs.read_write
         );
     }
 
