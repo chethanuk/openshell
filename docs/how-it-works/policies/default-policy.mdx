@@ -36,8 +36,9 @@ grants read-only access to these paths:
 - `/etc`
 - `/var/log`
 
-It grants read-write access to `/tmp` and `/dev/null`. Landlock user-policy
-compatibility is `best_effort`.
+It grants read-write access to `/tmp`, `/var/tmp`, and `/dev/null`. `/var/tmp`
+is included because SQLite may use it for temporary files when `SQLITE_TMPDIR`
+and `TMPDIR` are unset. Landlock user-policy compatibility is `best_effort`.
 
 ## Default Network Access
 
