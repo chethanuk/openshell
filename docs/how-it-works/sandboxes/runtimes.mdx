@@ -58,13 +58,15 @@ The supervisor image defaults to UID/GID `65534:65534`, including with a custom
 base. Compute drivers select the runtime identity explicitly. For direct image
 launches, make mounted runtime and log directories writable by the selected user.
 
-The supervisor image healthcheck connects to `/run/openshell/health.sock`,
-which a dedicated supervisor opens only while its sandbox session is ready.
+The supervisor image healthcheck connects to `/run/openshell/health.sock`.
+A dedicated supervisor opens this socket only when started with
+`--health-socket-path=/run/openshell/health.sock` and its sandbox session is ready.
 Docker and Podman set their own probes to match the socket they configure;
 Kubernetes uses TCP probes instead of the image healthcheck. For direct image
-launches, override the healthcheck to match a different readiness socket or
-the shared supervisor's TCP health listener. The standalone network-proxy
-role does not publish a readiness socket and needs a proxy-specific check.
+launches using another Unix socket, override the probe's `--socket` argument.
+For direct shared-supervisor or network-proxy launches, disable the inherited
+check with `docker run --no-healthcheck` and monitor readiness externally.
+The shell-free image has no TCP or proxy health-probe command.
 
 For TLS-enabled Docker, Podman, and MicroVM gateways, set `guest_tls_ca` in
 `[openshell.gateway]` or use the package-managed local CA. Remove the retired
