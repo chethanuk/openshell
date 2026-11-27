@@ -120,21 +120,8 @@ expect_status 2 "broad ignore path" \
   env TRIVY_IGNORE_FILE="${TMP_DIR}/broad-ignore.yaml" \
   "${SCANNER}" validate-ignore
 
-# These are controller configuration in kube-system, not application workloads.
-# Keep the exception conditional on the charts targeting their own namespaces.
+# Real kube-system workloads and networking permissions must remain visible.
 mkdir -p "${TMP_DIR}/namespaces"
-for manifest in \
-  deploy/kube/manifests/openshell-helmchart.yaml \
-  deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml; do
-  yq --output-format json '.' "${REPO_ROOT}/${manifest}" | jq -se '
-    length == 1 and all(.[];
-      .apiVersion == "helm.cattle.io/v1" and .kind == "HelmChart"
-      and .metadata.namespace == "kube-system"
-      and .spec.targetNamespace == .metadata.name
-      and .spec.targetNamespace != "kube-system")
-  ' >/dev/null
-  cp "${REPO_ROOT}/${manifest}" "${TMP_DIR}/namespaces/"
-done
 cat >"${TMP_DIR}/namespaces/user-pod.yaml" <<'EOF'
 apiVersion: v1
 kind: Pod
@@ -158,11 +145,11 @@ rules:
     verbs: ["create", "get"]
 EOF
 # Use embedded checks so this regression needs no network or cached database.
-expect_status 0 "scan HelmChart exceptions and a kube-system workload" \
+expect_status 0 "scan a kube-system workload and networking permissions" \
   trivy config --skip-version-check --skip-check-update --quiet \
   --cache-dir "${TMP_DIR}/trivy-cache" --ignorefile "${REPO_ROOT}/.trivyignore.yaml" \
   --format json --output "${TMP_DIR}/namespaces.json" "${TMP_DIR}/namespaces"
-jq -e '
+if ! jq -e '
   [.Results[]? as $result | $result.Misconfigurations[]?
     | select(.ID == "KSV-0037" or .ID == "KSV-0056")
     | {id: .ID, target: $result.Target}]
@@ -170,7 +157,12 @@ jq -e '
       {id: "KSV-0037", target: "user-pod.yaml"},
       {id: "KSV-0056", target: "role.yaml"}
     ]
-' "${TMP_DIR}/namespaces.json" >/dev/null
+' "${TMP_DIR}/namespaces.json" >/dev/null; then
+  echo "FAIL: expected kube-system Pod and NetworkPolicy permissions to remain findings; observed:" >&2
+  jq '[.Results[]? | {target: .Target, ids: [.Misconfigurations[]?.ID]}]' \
+    "${TMP_DIR}/namespaces.json" >&2
+  exit 1
+fi
 
 # Consolidate more than 20 Helm profiles without losing resource identity or
 # the per-profile input counts needed by the gate. Exercise real Trivy SARIF
