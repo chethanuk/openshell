@@ -45,6 +45,18 @@ pub(crate) struct CursoredEvent {
 /// Slot capacity of a per-sandbox broadcast channel.
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// Memory budget for one sandbox's tail, on top of the event-count cap.
+/// A count cap alone lets 2000 log lines pin several MiB per sandbox.
+const TAIL_MAX_BYTES: usize = 512 * 1024;
+
+/// Approximate memory one buffered event holds: the inline `CursoredEvent`
+/// (sized for the largest payload variant) plus its encoded field bytes.
+/// shortcut: `encoded_len` stands in for heap string capacity and map overhead;
+/// switch to a compact log-only entry type if the estimate proves too loose.
+fn tail_cost(cursored: &CursoredEvent) -> usize {
+    size_of::<CursoredEvent>() + prost::Message::encoded_len(&cursored.event)
+}
+
 #[derive(Debug, Clone)]
 struct PerSandbox {
     /// Created on first subscribe. Every slot is allocated with the channel,
@@ -53,6 +65,8 @@ struct PerSandbox {
     /// Shares each event's allocation with the channel; an inline
     /// `CursoredEvent` is sized for the full `Sandbox` payload variant.
     tail: VecDeque<Arc<CursoredEvent>>,
+    /// Sum of `tail_cost` over the events in `tail`.
+    tail_bytes: usize,
     /// Highest seq this bus has evicted from `tail`. 0 = nothing trimmed.
     ///
     /// Under the shared cursor space each bus's tail is non-contiguous in the
@@ -68,6 +82,7 @@ impl PerSandbox {
         Self {
             sender: None,
             tail: VecDeque::new(),
+            tail_bytes: 0,
             last_trimmed_seq: 0,
             last_active: Instant::now(),
         }
@@ -92,9 +107,14 @@ impl PerSandbox {
         if let Some(sender) = &self.sender {
             let _ = sender.send(Arc::clone(&cursored));
         }
+        self.tail_bytes += tail_cost(&cursored);
         self.tail.push_back(cursored);
-        while self.tail.len() > tail_cap {
+        // Always keep the newest event, even if it alone exceeds the byte budget.
+        while self.tail.len() > tail_cap
+            || (self.tail_bytes > TAIL_MAX_BYTES && self.tail.len() > 1)
+        {
             if let Some(trimmed) = self.tail.pop_front() {
+                self.tail_bytes -= tail_cost(&trimmed);
                 self.last_trimmed_seq = trimmed.seq;
             }
         }
@@ -814,6 +834,44 @@ mod tests {
                 oldest_available: 3,
             }
         );
+    }
+
+    #[test]
+    fn log_tail_is_capped_by_memory_and_trims_are_reported_as_a_gap() {
+        // (name, message bytes, lines). Every case stays under the 2000-line
+        // cap, so a count-only trim would keep every line.
+        let cases = [
+            ("short exec lines", 100, 2000),
+            ("4 KiB lines", 4 * 1024, 2000),
+            ("one oversized line then a small one", 2 * 1024 * 1024, 1),
+        ];
+        for (name, size, lines) in cases {
+            let bus = TracingLogBus::new();
+            let message = "x".repeat(size);
+            for _ in 0..lines {
+                bus.publish_external(make_log_event("sb", &message));
+            }
+            if lines == 1 {
+                // The oversized line alone is kept, then evicted by the next.
+                assert_eq!(bus.tail("sb", usize::MAX).len(), 1, "{name}");
+                bus.publish_external(make_log_event("sb", "small"));
+            }
+
+            let tail = bus.tail("sb", usize::MAX);
+            let held: usize = tail.iter().map(tail_cost).sum();
+            assert!(held <= TAIL_MAX_BYTES, "{name}: tail holds {held} bytes");
+            // Each event pins at least its inline size, whatever its encoding.
+            assert!(
+                tail.len() <= TAIL_MAX_BYTES / size_of::<CursoredEvent>(),
+                "{name}: kept {} events",
+                tail.len()
+            );
+
+            let gap = bus
+                .tail_after("sb", 0)
+                .expect_err("trimmed history must be reported as a resume gap");
+            assert_eq!(gap.oldest_available, tail[0].seq, "{name}");
+        }
     }
 
     #[test]
