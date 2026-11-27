@@ -316,6 +316,13 @@ so `resources: {}` retains these defaults. Use `resources.limits: null` to
 remove the limits, or `resources: null` to remove the whole budget. Removing
 requests also requires disabling any HPA utilization targets that depend on them.
 
+Before upgrading an existing release, check its gateway memory usage. Installs
+that never set `resources` gain the `2Gi` memory limit when adopting these
+defaults and can be OOM-killed if their usage exceeds it. Requests-only
+overrides also retain default limits: `resources.requests.memory: 4Gi` with
+the default `2Gi` limit produces an invalid Pod. Set matching limits for your
+workload or remove them explicitly before upgrading.
+
 Scale the gateway by changing a fixed replica count or by letting a
 HorizontalPodAutoscaler choose one. In both cases, keep at least two ready
 replicas when availability must survive one gateway pod failure, and size
