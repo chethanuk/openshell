@@ -30,6 +30,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
@@ -375,13 +376,25 @@ async fn handle_connection(
     );
 
     let handler = SshHandler::new(port_forward, boundary_exec, main_session, server_endpoint);
+    let exit_status_sent = handler.exit_status_sent.clone();
     let stream = peer_stream::PeerStream::new(stream, peer_timeout);
-    russh::server::run_stream(config, stream, handler)
+    let session = russh::server::run_stream(config, stream, handler)
         .await
-        .map_err(|err| miette::miette!("ssh stream error: {err}"))?
-        .await
-        .map_err(|err| miette::miette!("ssh session error: {err}"))?;
-    Ok(())
+        .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
+    match session.await {
+        Ok(()) => Ok(()),
+        // Clients such as OpenSSH behind a ProxyCommand drop the transport
+        // without a disconnect once the command has exited. That is a normal end.
+        Err(err) if exit_status_sent.load(Ordering::Relaxed) && is_transport_eof(&err) => Ok(()),
+        Err(err) => Err(miette::miette!("ssh session error: {err}")),
+    }
+}
+
+fn is_transport_eof(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<russh::Error>(),
+        Some(russh::Error::IO(io)) if io.kind() == std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// Per-channel state for tracking PTY resources and I/O senders.
@@ -444,6 +457,9 @@ struct SshHandler {
     /// This server's endpoint, named on every SSH event it emits.
     server_endpoint: Arc<openshell_ocsf::Endpoint>,
     channels: HashMap<ChannelId, ChannelState>,
+    /// Set once any channel is sent an exit status, so a later transport EOF
+    /// is a normal session end rather than a failure.
+    exit_status_sent: Arc<AtomicBool>,
 }
 
 impl Drop for SshHandler {
@@ -478,6 +494,7 @@ impl SshHandler {
             main_session,
             server_endpoint,
             channels: HashMap::new(),
+            exit_status_sent: Arc::default(),
         }
     }
 }
@@ -815,6 +832,7 @@ impl russh::server::Handler for SshHandler {
                         )
                         .into_bytes(),
                     )?;
+                    self.exit_status_sent.store(true, Ordering::Relaxed);
                     session.exit_status_request(channel, 1)?;
                     session.eof(channel)?;
                     session.close(channel)?;
@@ -852,6 +870,7 @@ impl russh::server::Handler for SshHandler {
             state.main_detach_prefix_pending = false;
             let mut output = main_session.subscribe();
             let terminal_delivery = main_session.clone();
+            let exit_status_sent = self.exit_status_sent.clone();
             let handle = session.handle();
             session.channel_success(channel)?;
             if let Some(error) = warning {
@@ -868,6 +887,9 @@ impl russh::server::Handler for SshHandler {
                     match output.recv().await {
                         Ok(MainOutput::Exit(code)) => {
                             terminal_delivery.wait_for_terminal_reported().await;
+                            // Set before sending so a client that drops right after
+                            // reading the status is never seen as a mid-session EOF.
+                            exit_status_sent.store(true, Ordering::Relaxed);
                             let _ =
                                 send_main_output(&handle, channel, MainOutput::Exit(code)).await;
                             break;
@@ -1245,6 +1267,7 @@ impl SshHandler {
         // no output credit, russh would retain it and stop draining Handle
         // messages for other channels. Exit status needs no output credit.
         warn!(?channel, "{reason}; terminating exec");
+        self.exit_status_sent.store(true, Ordering::Relaxed);
         session.exit_status_request(channel, 74)?;
         session.eof(channel)?;
         session.close(channel)?;
@@ -1278,6 +1301,7 @@ impl SshHandler {
         if let Some(output) = output {
             let diagnostic =
                 format!("openshell: cannot start command: {error}{line_ending}").into_bytes();
+            let exit_status_sent = self.exit_status_sent.clone();
             tokio::spawn(async move {
                 // Reserve client credit before queueing bytes. Session output
                 // would buffer stderr without credit and block closure and
@@ -1289,11 +1313,13 @@ impl SshHandler {
                 .await;
                 // Diagnostics may be partial or absent; terminal messages
                 // must still be sent when the peer withholds output credit.
+                exit_status_sent.store(true, Ordering::Relaxed);
                 let _ = output.exit_status(1).await;
                 let _ = output.eof().await;
                 let _ = output.close().await;
             });
         } else {
+            self.exit_status_sent.store(true, Ordering::Relaxed);
             session.exit_status_request(channel, 1)?;
             session.eof(channel)?;
             session.close(channel)?;
@@ -1398,6 +1424,7 @@ impl SshHandler {
 
         // Upload stdout carries only credit, so extraction output uses stderr.
         let stdout_extended = finisher.is_some();
+        let exit_status_sent = self.exit_status_sent.clone();
         let mut stdout = exec.stdout;
         let stdout_handle = handle.clone();
         let stdout_task = tokio::spawn(async move {
@@ -1469,6 +1496,7 @@ impl SshHandler {
                 return;
             };
             let _ = handle.eof(channel).await;
+            exit_status_sent.store(true, Ordering::Relaxed);
             let _ = handle.exit_status_request(channel, code).await;
             let _ = handle.close(channel).await;
         });
@@ -1510,6 +1538,7 @@ impl SshHandler {
                 .await;
         }
         let _ = handle.eof(channel).await;
+        self.exit_status_sent.store(true, Ordering::Relaxed);
         let _ = handle.exit_status_request(channel, 0).await;
         let _ = handle.close(channel).await;
     }
@@ -1870,6 +1899,162 @@ mod tests {
             .expect("auth_none should not error");
         assert!(matches!(auth, russh::client::AuthResult::Success));
         client
+    }
+
+    /// A process that exits 0 at once with no output.
+    struct ExitsZeroExec;
+
+    struct ExitedZero;
+
+    #[async_trait::async_trait]
+    impl rpc_test::BoundaryProcess for ExitedZero {
+        async fn wait(
+            &self,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::BoundaryExitStatus,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Ok(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(0))
+        }
+
+        async fn signal(
+            &self,
+            _signal: openshell_isolation_interface::contract::BoundarySignal,
+        ) -> std::result::Result<(), openshell_isolation_interface::contract::BackendError>
+        {
+            Ok(())
+        }
+
+        async fn terminate(
+            &self,
+        ) -> std::result::Result<(), openshell_isolation_interface::contract::BackendError>
+        {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rpc_test::BoundaryExec for ExitsZeroExec {
+        async fn exec(
+            &self,
+            _spec: openshell_isolation_interface::contract::ExecSpec,
+        ) -> std::result::Result<
+            rpc_test::ExecSession,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Ok(rpc_test::ExecSession {
+                process: Arc::new(ExitedZero),
+                stdin: Some(Box::new(tokio::io::sink())),
+                stdout: Box::new(tokio::io::empty()),
+                stderr: None,
+                terminal: None,
+                output_status: None,
+            })
+        }
+    }
+
+    /// Run one SSH connection through `handle_connection`, optionally run a
+    /// command until its exit status arrives, then drop the transport with no
+    /// SSH disconnect message (OpenSSH behind a ProxyCommand does this).
+    async fn drop_transport_after(
+        boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
+        run_command: bool,
+    ) -> Result<()> {
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let mut server_config = russh::server::Config {
+            auth_rejection_time: Duration::from_millis(1),
+            ..Default::default()
+        };
+        server_config.keys.push(host_key);
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+        let server = tokio::spawn(handle_connection(
+            server_stream,
+            Arc::new(server_config),
+            rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+            boundary_exec,
+            None,
+            Arc::new(ssh_server_endpoint(Path::new(
+                "/run/openshell/test/ssh.sock",
+            ))),
+            Duration::from_secs(30),
+        ));
+
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_stream,
+            AcceptAnyServerKey,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            client.authenticate_none("sandbox").await.unwrap(),
+            russh::client::AuthResult::Success
+        ));
+        let mut channel = client.channel_open_session().await.unwrap();
+        if run_command {
+            channel.exec(true, "true").await.unwrap();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), channel.wait())
+                    .await
+                    .expect("exit status must arrive")
+                {
+                    Some(russh::ChannelMsg::ExitStatus { .. }) => break,
+                    Some(_) => {}
+                    None => panic!("channel closed before exit status"),
+                }
+            }
+        }
+        drop(channel);
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server session must end")
+            .unwrap()
+    }
+
+    /// A transport EOF after an exit status is a normal end; one before any
+    /// exit status ended mid-session and stays a failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transport_eof_is_a_failure_only_before_an_exit_status() {
+        let cases: [(
+            &str,
+            Arc<openshell_sandbox_backend::BoundaryExec>,
+            bool,
+            bool,
+        ); 3] = [
+            (
+                "command exits 0",
+                rpc_test::exec(Arc::new(ExitsZeroExec)),
+                true,
+                true,
+            ),
+            (
+                "command fails to start",
+                rpc_test::exec(Arc::new(RejectingExec)),
+                true,
+                true,
+            ),
+            (
+                "no command run",
+                rpc_test::exec(Arc::new(RejectingExec)),
+                false,
+                false,
+            ),
+        ];
+        for (name, exec, run_command, normal_end) in cases {
+            let result = drop_transport_after(exec, run_command).await;
+            if normal_end {
+                assert!(result.is_ok(), "{name}: normal end reported as {result:?}");
+            } else {
+                let err = result.expect_err(name);
+                assert!(
+                    err.to_string().contains("early eof"),
+                    "{name}: unexpected error: {err}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
